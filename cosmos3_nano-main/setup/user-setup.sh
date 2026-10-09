@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# Per-user half of the setup (called by brev-setup.sh as the login user, normally `ubuntu`).
+# Builds the two Python environments, registers the Jupyter kernels the notebooks
+# reference, logs into Hugging Face and starts the Reasoner NIM.
+set -euo pipefail
+
+REPO_DIR="${REPO_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+COSMOS_ROOT=/opt/cosmos
+COSMOS3_REPO=/opt/cosmos3-framework
+JUPYTER_VENV=/opt/dli-jupyter
+DLI_OUTPUTS="$REPO_DIR/outputs"  # notebook N writes everything it generates to outputs/notebookN
+UV_GROUP="${UV_GROUP:-auto}"     # cu130-train | cu128-train | auto (from the driver's CUDA version)
+mkdir -p "$DLI_OUTPUTS"/notebook{1,2,3,4}
+
+log() { printf '\n\033[1;36m--> %s\033[0m\n' "$*"; }
+die() { printf '\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
+
+# ------------------------------------------------------------------ GPU / CUDA
+command -v nvidia-smi >/dev/null || die "nvidia-smi not found"
+nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
+CUDA_VER=$(nvidia-smi | grep -oE 'CUDA Version: [0-9]+\.[0-9]+' | grep -oE '[0-9]+\.[0-9]+')
+if [[ "$UV_GROUP" == auto ]]; then
+  if awk -v v="$CUDA_VER" 'BEGIN{exit !(v>=13.0)}'; then UV_GROUP=cu130-train; else UV_GROUP=cu128-train; fi
+fi
+awk -v v="$CUDA_VER" 'BEGIN{exit !(v>=12.8)}' || die "cosmos-framework needs a CUDA >= 12.8 driver (found $CUDA_VER)"
+log "driver CUDA $CUDA_VER -> dependency group $UV_GROUP"
+
+# ------------------------------------------------------------------------ uv
+export PATH="$HOME/.local/bin:$PATH"
+command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
+uv --version
+
+# ------------------------------------------------------ NVIDIA/cosmos cookbook
+log "NVIDIA/cosmos -> $COSMOS_ROOT (assets + specs for 02/03/04)"
+if [[ -d "$COSMOS_ROOT/.git" ]]; then git -C "$COSMOS_ROOT" pull --ff-only
+else git clone --depth 1 https://github.com/NVIDIA/cosmos "$COSMOS_ROOT"; fi
+for d in reasoner/assets generator/audiovisual generator/transfer generator/action; do
+  [[ -d "$COSMOS_ROOT/cookbooks/cosmos3/$d" ]] || die "missing $COSMOS_ROOT/cookbooks/cosmos3/$d (upstream layout changed?)"
+done
+
+# ---------------------------------------------------- NVIDIA/cosmos-framework
+log "NVIDIA/cosmos-framework -> $COSMOS3_REPO, uv sync --all-extras --group=$UV_GROUP (slow: torch + CUDA wheels)"
+if [[ -d "$COSMOS3_REPO/.git" ]]; then git -C "$COSMOS3_REPO" pull --ff-only
+else git clone https://github.com/NVIDIA/cosmos-framework "$COSMOS3_REPO"; fi
+(
+  cd "$COSMOS3_REPO"
+  uv sync --all-extras --group="$UV_GROUP"
+  uv pip install --python .venv/bin/python ipykernel imageio-ffmpeg matplotlib   # imported by 04, not framework deps
+  LD_LIBRARY_PATH= .venv/bin/python -c "import torch, cosmos_framework; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
+)
+mkdir -p "$COSMOS3_REPO/outputs"
+
+# --------------------------------------------------------- Jupyter venv (01/02)
+log "Jupyter venv -> $JUPYTER_VENV"
+[[ -x "$JUPYTER_VENV/bin/python" ]] || python3 -m venv "$JUPYTER_VENV"
+"$JUPYTER_VENV/bin/pip" install -q -U pip
+"$JUPYTER_VENV/bin/pip" install -q -U jupyterlab ipykernel ipywidgets openai requests pillow huggingface_hub
+
+# ---------------------------------------------------------------- kernelspecs
+# Names must match metadata.kernelspec.name in the notebooks so VS Code / Jupyter
+# pick the right environment automatically.
+log "Kernels: dli-python3 (01/02) and cosmos3 (03/04)"
+"$JUPYTER_VENV/bin/python" -m ipykernel install --user --name dli-python3 --display-name "Python 3 (DLI)"
+"$COSMOS3_REPO/.venv/bin/python" -m ipykernel install --user --name cosmos3 --display-name "Cosmos 3 (framework)"
+python3 - "$HOME/.local/share/jupyter/kernels" "$COSMOS_ROOT" "$COSMOS3_REPO" "$JUPYTER_VENV" "$DLI_OUTPUTS" <<'EOF'
+import json, sys, os
+kdir, cosmos_root, cosmos3_repo, jupyter_venv, dli_outputs = sys.argv[1:]
+common = {"COSMOS_ROOT": cosmos_root, "COSMOS3_REPO": cosmos3_repo, "DLI_OUTPUTS": dli_outputs,
+          "NIM_BASE_URL": "http://cosmos3-reasoner:8000",
+          "HF_HOME": os.path.expanduser("~/.cache/huggingface"),
+          # The framework's isolated `hf` CLI crashes on the Xet transfer backend while fetching
+          # nvidia/Cosmos-Guardrail1 ("Unable to parse string as hex hash value"); plain HTTP works.
+          "HF_HUB_DISABLE_XET": "1"}
+envs = {
+    "dli-python3": {**common, "PATH": f"{jupyter_venv}/bin:" + os.environ["PATH"]},   # so `!hf ...` works in 01
+    # PATH: the framework shells out to `uv run ... hf download` for Cosmos-Guardrail1; Brev's
+    # jupyter.service PATH lacks ~/.local/bin, so the kernel must carry it (FileNotFoundError: uv).
+    "cosmos3":     {**common, "CUDA_VISIBLE_DEVICES": "0", "LD_LIBRARY_PATH": "",
+                    "PATH": os.environ["PATH"]},
+}
+for name, env in envs.items():
+    p = f"{kdir}/{name}/kernel.json"
+    k = json.load(open(p)); k["env"] = env
+    json.dump(k, open(p, "w"), indent=1)
+    print(name, "->", json.dumps(env))
+EOF
+
+# --------------------------------------------------------------- env file
+cat >"$HOME/.cosmos3-dli.env" <<EOF
+# generated by cosmos3_nano/setup/user-setup.sh $(date -Is)
+export COSMOS_ROOT="$COSMOS_ROOT"
+export COSMOS3_REPO="$COSMOS3_REPO"
+export JUPYTER_VENV="$JUPYTER_VENV"
+export DLI_OUTPUTS="$DLI_OUTPUTS"
+export CUDA_VISIBLE_DEVICES=0
+export NIM_BASE_URL="http://cosmos3-reasoner:8000"
+export HF_HOME="\$HOME/.cache/huggingface"
+export HF_HUB_DISABLE_XET=1   # Xet backend crashes on the Cosmos-Guardrail1 download
+export LOCAL_NIM_CACHE="\$HOME/.cache/nim"
+export PATH="\$HOME/.local/bin:$JUPYTER_VENV/bin:\$PATH"
+EOF
+
+# ------------------------------------------------------------- Hugging Face
+mkdir -p "$HOME/.cache/huggingface"
+if [[ -n "${HF_TOKEN:-}" ]]; then
+  log "Hugging Face login"
+  HF_TOKEN= "$JUPYTER_VENV/bin/hf" auth login --token "$HF_TOKEN" >/dev/null && "$JUPYTER_VENV/bin/hf" auth whoami
+  # Generation in 03/04 downloads the gated guardrail model first; fail loudly here, not mid-workshop.
+  "$JUPYTER_VENV/bin/python" - <<'PY' || true
+from huggingface_hub import HfApi
+try:
+    HfApi().auth_check("nvidia/Cosmos-Guardrail1"); print("Cosmos-Guardrail1: access OK")
+except Exception as e:
+    print(f"WARNING: no access to nvidia/Cosmos-Guardrail1 ({type(e).__name__}). Accept its licence at "
+          "https://huggingface.co/nvidia/Cosmos-Guardrail1 with this account, or notebooks 03/04 will fail.")
+PY
+else
+  echo "HF_TOKEN not provided - run notebook 01 (or \`hf auth login\`) before 03."
+fi
+
+# ------------------------------------------------------------------- NIM
+if [[ -n "${NGC_API_KEY:-}" ]]; then
+  log "Reasoner NIM (starts in the background; ~10 min on first boot while it downloads)"
+  NIM_WAIT=0 bash "$REPO_DIR/setup/nim.sh" start || echo "NIM start failed - see ~/nim.sh logs; retry with ~/nim.sh start"
+else
+  echo "NGC_API_KEY not provided - run: export NGC_API_KEY=nvapi-...; ~/nim.sh start"
+fi
+
+df -h / | tail -1 | awk '{print "free disk: " $4}'
